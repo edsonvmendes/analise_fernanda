@@ -75,10 +75,7 @@ header[data-testid="stHeader"]{ background: transparent; }
   font-size: 12px;
   font-weight: 800;
 }
-.clock{
-  color: var(--muted);
-  font-size: 12px;
-}
+.clock{ color: var(--muted); font-size: 12px; }
 .live{
   display:inline-flex;
   align-items:center;
@@ -87,9 +84,7 @@ header[data-testid="stHeader"]{ background: transparent; }
   font-size: 12px;
   font-weight: 800;
 }
-.dot{
-  width:8px; height:8px; border-radius:999px; background:#10b981; display:inline-block;
-}
+.dot{ width:8px; height:8px; border-radius:999px; background:#10b981; display:inline-block; }
 
 .alert{
   background: #fee2e2;
@@ -141,6 +136,7 @@ header[data-testid="stHeader"]{ background: transparent; }
   border: 1px solid var(--border);
   background:#f8fafc;
   color: var(--muted);
+  white-space: nowrap;
 }
 .badge.red{ background:#fee2e2; border-color:#fecaca; color:#991b1b; }
 .badge.green{ background:#dcfce7; border-color:#bbf7d0; color:#166534; }
@@ -220,16 +216,93 @@ def kpi_card(label: str, value: str, icon_text: str = "•", badge_text: str | N
     </div>
     """
 
+# =========================
+# Loaders (Excel upload)
+# =========================
 @st.cache_data(ttl=3600)
-def load_excel(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
-    # Comentario: Lee el Excel desde bytes (upload) y normaliza
+def load_excel_data(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    # Comentario: Lee el Excel de datos desde bytes (upload), normaliza y calcula m²
     df = pd.read_excel(file_bytes, sheet_name=sheet_name)
     df = normalize_date_column(df, "DATA")
     df = enrich_m2(df)
     return df
 
+@st.cache_data(ttl=3600)
+def load_excel_metas(file_bytes: bytes) -> pd.DataFrame:
+    # Comentario: Lee el Excel de metas (sheet: Metas)
+    df = pd.read_excel(file_bytes, sheet_name="Metas")
+
+    # Comentario: Limpieza mínima y tipado
+    needed = ["Nivel", "Referencia", "Metrica", "Periodo", "Meta"]
+    for c in needed:
+        if c not in df.columns:
+            raise ValueError(f"Coluna obrigatória ausente no Excel de metas: {c}")
+
+    df = df.dropna(subset=needed).copy()
+    df["Nivel"] = df["Nivel"].astype(str).str.strip()
+    df["Referencia"] = df["Referencia"].astype(str).str.strip()
+    df["Metrica"] = df["Metrica"].astype(str).str.strip()
+    df["Periodo"] = df["Periodo"].astype(str).str.strip()
+    df["Meta"] = pd.to_numeric(df["Meta"], errors="coerce")
+    df["Prioridade"] = pd.to_numeric(df.get("Prioridade", 99), errors="coerce").fillna(99).astype(int)
+
+    # Comentario: Fechas opcionales (validez)
+    if "Ativo de" in df.columns:
+        df["Ativo de"] = pd.to_datetime(df["Ativo de"], errors="coerce").dt.date
+    else:
+        df["Ativo de"] = pd.NaT
+
+    if "Ativo até" in df.columns:
+        df["Ativo até"] = pd.to_datetime(df["Ativo até"], errors="coerce").dt.date
+    else:
+        df["Ativo até"] = pd.NaT
+
+    df = df[df["Meta"].notna()].copy()
+    return df
+
+def _metas_validas_no_periodo(df_metas: pd.DataFrame, d1, d2) -> pd.DataFrame:
+    # Comentario: Filtra metas por ventana de validez (si existe)
+    if df_metas is None or df_metas.empty:
+        return df_metas
+    df = df_metas.copy()
+    # Comentario: Si no hay fecha, consideramos válida
+    cond_ini = df["Ativo de"].isna() | (df["Ativo de"] <= d2)
+    cond_fim = df["Ativo até"].isna() | (df["Ativo até"] >= d1)
+    return df[cond_ini & cond_fim].copy()
+
+def resolve_meta_diaria_m2_total(df_metas: pd.DataFrame, contexto: dict, d1, d2) -> float | None:
+    """
+    Comentario: Devuelve la meta (Dia, m2_total) según jerarquía:
+    Equipe > Supervisor > Encarregado > Tipo > Geral
+    """
+    if df_metas is None or df_metas.empty:
+        return None
+
+    df = _metas_validas_no_periodo(df_metas, d1, d2)
+
+    # Comentario: Solo para este MVP: m2_total y Dia
+    df = df[(df["Metrica"] == "m2_total") & (df["Periodo"] == "Dia")].copy()
+    if df.empty:
+        return None
+
+    ordem = ["Equipe", "Supervisor", "Encarregado", "Tipo", "Geral"]
+    for nivel in ordem:
+        if nivel == "Geral":
+            ref = "ALL"
+        else:
+            ref = contexto.get(nivel)
+
+        if not ref:
+            continue
+
+        cand = df[(df["Nivel"] == nivel) & (df["Referencia"] == str(ref).strip())].copy()
+        if not cand.empty:
+            return float(cand.sort_values("Prioridade").iloc[0]["Meta"])
+
+    return None
+
 # =========================
-# Acesso (senha simples)
+# Sidebar: Acesso + Upload
 # =========================
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 
@@ -240,33 +313,56 @@ with st.sidebar:
         st.warning("Acesso restrito.")
         st.stop()
 
-# =========================
-# Upload + parâmetros
-# =========================
-with st.sidebar:
     st.markdown("## Carregar dados")
-    up = st.file_uploader("Upload do Excel (.xlsx)", type=["xlsx"])
-    sheet = st.text_input("Nome da aba (sheet)", value="Respostas ao formulário 1")
+    up_data = st.file_uploader("Upload do Excel (dados) — .xlsx", type=["xlsx"], key="dados")
+    sheet_name = st.text_input("Nome da aba (dados)", value="Respostas ao formulário 1")
+
+    st.markdown("## Metas (opcional)")
+    up_metas = st.file_uploader("Upload do Excel (metas) — .xlsx", type=["xlsx"], key="metas")
+
     colA, colB = st.columns(2)
     with colA:
         processar = st.button("📥 Processar")
     with colB:
-        if st.button("🧹 Limpar cache"):
-            st.cache_data.clear()
-            st.session_state.pop("df", None)
+        limpar = st.button("🧹 Limpar sessão")
 
-# Comentario: Processamiento controlado por botón (no automático)
+    if limpar:
+        st.cache_data.clear()
+        st.session_state.pop("df", None)
+        st.session_state.pop("df_metas", None)
+        st.session_state.pop("meta", None)
+        st.session_state.pop("meta_context", None)
+
+# =========================
+# Processamento por botão
+# =========================
 if processar:
-    if up is None:
-        st.error("Faça upload do arquivo Excel primeiro.")
-        st.stop()
-    try:
-        st.session_state["df"] = load_excel(up.getvalue(), sheet)
-    except Exception as e:
-        st.error(f"Erro ao ler o Excel/aba. Verifique o nome da aba. Detalhe: {e}")
+    if up_data is None:
+        st.error("Faça upload do Excel de dados primeiro.")
         st.stop()
 
-# Comentario: Si no hay datos cargados aún, mostrar instrucción
+    try:
+        df_loaded = load_excel_data(up_data.getvalue(), sheet_name)
+    except Exception as e:
+        st.error(f"Erro ao ler o Excel/aba de dados. Verifique o nome da aba. Detalhe: {e}")
+        st.stop()
+
+    st.session_state["df"] = df_loaded
+
+    # Comentario: Metas son opcionales
+    if up_metas is not None:
+        try:
+            dfm = load_excel_metas(up_metas.getvalue())
+            st.session_state["df_metas"] = dfm
+        except Exception as e:
+            st.error(f"Erro ao ler o Excel de metas (aba 'Metas'). Detalhe: {e}")
+            st.stop()
+    else:
+        st.session_state["df_metas"] = None
+
+# =========================
+# Estado: sem dados carregados
+# =========================
 if "df" not in st.session_state:
     st.markdown("""
     <div class="card">
@@ -274,8 +370,9 @@ if "df" not in st.session_state:
       <div class="section-sub">MVP online (upload do Excel)</div>
       <ol style="color:#334155; margin:0; padding-left:18px;">
         <li>Digite a senha</li>
-        <li>Faça upload do Excel</li>
+        <li>Faça upload do Excel (dados)</li>
         <li>Confirme o nome da aba</li>
+        <li>(Opcional) Faça upload do Excel (metas)</li>
         <li>Clique em <b>Processar</b></li>
       </ol>
     </div>
@@ -283,16 +380,17 @@ if "df" not in st.session_state:
     st.stop()
 
 df = st.session_state["df"]
+df_metas = st.session_state.get("df_metas", None)
+
 if df.empty:
     st.warning("A base carregada está vazia após normalização de DATA.")
     st.stop()
 
 # =========================
-# Sidebar filtros
+# Sidebar filtros (depois do carregamento)
 # =========================
 with st.sidebar:
     st.markdown("## Filtros")
-
     dmin, dmax = min(df["DATA"]), max(df["DATA"])
     date_range = st.date_input("Período", value=(dmin, dmax), min_value=dmin, max_value=dmax)
     d1, d2 = date_range if isinstance(date_range, tuple) else (dmin, dmax)
@@ -352,7 +450,7 @@ if outliers > 0:
     """, unsafe_allow_html=True)
 
 # =========================
-# KPIs
+# KPIs principais
 # =========================
 m2_total = float(df_f["m2_total"].sum())
 dias = int(df_f["DATA"].nunique())
@@ -360,12 +458,55 @@ m2_por_dia = (m2_total / dias) if dias else 0.0
 equipes_ativas = int(df_f["EQUIPE"].nunique()) if "EQUIPE" in df_f.columns else 0
 registros = int(len(df_f))
 
+# =========================
+# Resolver meta (m²/dia para m2_total)
+# =========================
+# Comentario: Si hay múltiples selecciones, este MVP aplica meta por "Equipe" SOLO si hay 1 equipo seleccionado.
+contexto = {}
+if len(sel_equipes) == 1:
+    contexto["Equipe"] = sel_equipes[0]
+if len(sel_sup) == 1:
+    contexto["Supervisor"] = sel_sup[0]
+if len(sel_enc) == 1:
+    contexto["Encarregado"] = sel_enc[0]
+
+meta_diaria = resolve_meta_diaria_m2_total(df_metas, contexto, d1, d2)
+
+# Badge da meta
+badge_meta_text = None
+badge_meta_kind = "blue"
+if meta_diaria is None:
+    badge_meta_text = "Sem meta"
+    badge_meta_kind = "blue"
+else:
+    if m2_por_dia >= meta_diaria:
+        badge_meta_text = f"🟢 Meta: {fmt_int_br(meta_diaria)}"
+        badge_meta_kind = "green"
+    else:
+        badge_meta_text = f"🔴 Meta: {fmt_int_br(meta_diaria)}"
+        badge_meta_kind = "red"
+
+# =========================
+# KPIs row (cards)
+# =========================
 k1, k2, k3, k4, k5 = st.columns(5)
-with k1: st.markdown(kpi_card("m² total", fmt_int_br(m2_total), "🧱"), unsafe_allow_html=True)
-with k2: st.markdown(kpi_card("m² / dia (média)", fmt_int_br(m2_por_dia), "📈"), unsafe_allow_html=True)
-with k3: st.markdown(kpi_card("Dias", str(dias), "🗓️"), unsafe_allow_html=True)
-with k4: st.markdown(kpi_card("Equipes ativas", str(equipes_ativas), "👷"), unsafe_allow_html=True)
-with k5: st.markdown(kpi_card("Registros", str(registros), "🧾"), unsafe_allow_html=True)
+with k1:
+    st.markdown(kpi_card("m² total", fmt_int_br(m2_total), "🧱"), unsafe_allow_html=True)
+with k2:
+    st.markdown(kpi_card("m² / dia (média)", fmt_int_br(m2_por_dia), "📈", badge_meta_text, badge_meta_kind), unsafe_allow_html=True)
+with k3:
+    st.markdown(kpi_card("Dias", str(dias), "🗓️"), unsafe_allow_html=True)
+with k4:
+    st.markdown(kpi_card("Equipes ativas", str(equipes_ativas), "👷"), unsafe_allow_html=True)
+with k5:
+    st.markdown(kpi_card("Registros", str(registros), "🧾"), unsafe_allow_html=True)
+
+# Mensagem rápida sobre contexto
+if meta_diaria is not None:
+    if len(sel_equipes) != 1:
+        st.caption("Meta aplicada: usando regra mais geral disponível (ou nível diferente de Equipe), porque há 0 ou várias equipes selecionadas.")
+else:
+    st.caption("Nenhuma meta aplicada. (Opcional) Faça upload do Excel de metas para ativar comparação.")
 
 st.write("")
 
@@ -376,32 +517,49 @@ c1, c2 = st.columns([1.35, 1])
 
 with c1:
     st.markdown('<div class="card"><div class="section-title">Tendência</div><div class="section-sub">m² por dia</div>', unsafe_allow_html=True)
+
     trend = df_f.groupby("DATA", as_index=False)["m2_total"].sum().sort_values("DATA")
 
-    chart = alt.Chart(trend).mark_area(
+    area = alt.Chart(trend).mark_area(
         line={"color": "#2563eb", "strokeWidth": 3},
         opacity=0.18
     ).encode(
         x=alt.X("DATA:T", title=None),
         y=alt.Y("m2_total:Q", title=None),
-        tooltip=[alt.Tooltip("DATA:T", title="Data"),
-                 alt.Tooltip("m2_total:Q", title="m²", format=",.0f")]
-    ).properties(height=260)
+        tooltip=[
+            alt.Tooltip("DATA:T", title="Data"),
+            alt.Tooltip("m2_total:Q", title="m²", format=",.0f")
+        ]
+    )
 
-    st.altair_chart(chart, use_container_width=True)
+    layers = [area]
+
+    # Comentario: Línea de meta (si existe)
+    if meta_diaria is not None:
+        meta_line = alt.Chart(pd.DataFrame({"meta": [meta_diaria]})).mark_rule(
+            color="#ef4444", strokeWidth=2
+        ).encode(
+            y="meta:Q",
+            tooltip=[alt.Tooltip("meta:Q", title="Meta (m²/dia)", format=",.0f")]
+        )
+        layers.append(meta_line)
+
+    st.altair_chart(alt.layer(*layers).properties(height=260), use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 with c2:
     st.markdown('<div class="card"><div class="section-title">Ranking</div><div class="section-sub">Top equipes por m²</div>', unsafe_allow_html=True)
-    rank = df_f.groupby("EQUIPE", as_index=False)["m2_total"].sum().sort_values("m2_total", ascending=False).head(10)
 
+    rank = df_f.groupby("EQUIPE", as_index=False)["m2_total"].sum().sort_values("m2_total", ascending=False).head(10)
     bar = alt.Chart(rank).mark_bar(
         cornerRadiusTopRight=10, cornerRadiusBottomRight=10, color="#2563eb"
     ).encode(
         y=alt.Y("EQUIPE:N", sort="-x", title=None),
         x=alt.X("m2_total:Q", title=None),
-        tooltip=[alt.Tooltip("EQUIPE:N", title="Equipe"),
-                 alt.Tooltip("m2_total:Q", title="m²", format=",.0f")]
+        tooltip=[
+            alt.Tooltip("EQUIPE:N", title="Equipe"),
+            alt.Tooltip("m2_total:Q", title="m²", format=",.0f")
+        ]
     ).properties(height=260)
 
     st.altair_chart(bar, use_container_width=True)
@@ -413,6 +571,7 @@ c3, c4 = st.columns([1, 1])
 
 with c3:
     st.markdown('<div class="card"><div class="section-title">Composição</div><div class="section-sub">Manual vs Tratores vs Robô</div>', unsafe_allow_html=True)
+
     comp_df = pd.DataFrame({
         "Tipo": ["Manual", "Tratores", "Robô"],
         "m2": [float(df_f["m2_manual"].sum()), float(df_f["m2_tratores"].sum()), float(df_f["m2_robo"].sum())]
@@ -420,9 +579,12 @@ with c3:
 
     donut = alt.Chart(comp_df).mark_arc(innerRadius=70).encode(
         theta=alt.Theta("m2:Q"),
-        color=alt.Color("Tipo:N", scale=alt.Scale(range=["#94a3b8", "#2563eb", "#10b981"]), legend=alt.Legend(title=None)),
-        tooltip=[alt.Tooltip("Tipo:N", title="Tipo"),
-                 alt.Tooltip("m2:Q", title="m²", format=",.0f")]
+        color=alt.Color("Tipo:N", scale=alt.Scale(range=["#94a3b8", "#2563eb", "#10b981"]),
+                        legend=alt.Legend(title=None)),
+        tooltip=[
+            alt.Tooltip("Tipo:N", title="Tipo"),
+            alt.Tooltip("m2:Q", title="m²", format=",.0f")
+        ]
     ).properties(height=260)
 
     st.altair_chart(donut, use_container_width=True)
@@ -430,12 +592,23 @@ with c3:
 
 with c4:
     st.markdown('<div class="card"><div class="section-title">Qualidade</div><div class="section-sub">checagens rápidas</div>', unsafe_allow_html=True)
+
     zero = int((df_f["m2_total"] <= 0).sum())
     st.markdown(f"- **m² = 0**: {zero} registros")
     st.markdown(f"- **Outliers** (p95): {outliers} registros")
+
     st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown('<span class="badge blue">Recomendação</span>', unsafe_allow_html=True)
-    st.markdown("Validar KM e LARGURA nos registros fora do padrão para consolidar números oficiais.")
+    if meta_diaria is None:
+        st.markdown('<span class="badge blue">Meta</span>', unsafe_allow_html=True)
+        st.markdown("Upload do Excel de metas para ativar comparação automática.")
+    else:
+        if m2_por_dia >= meta_diaria:
+            st.markdown('<span class="badge green">Meta atingida</span>', unsafe_allow_html=True)
+            st.markdown(f"Média diária: **{fmt_int_br(m2_por_dia)}** ≥ Meta: **{fmt_int_br(meta_diaria)}**")
+        else:
+            st.markdown('<span class="badge red">Abaixo da meta</span>', unsafe_allow_html=True)
+            st.markdown(f"Média diária: **{fmt_int_br(m2_por_dia)}** < Meta: **{fmt_int_br(meta_diaria)}**")
+
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.write("")
@@ -460,6 +633,7 @@ if not show_all:
     df_show = df_show.head(500)
 
 st.dataframe(df_show, use_container_width=True, hide_index=True)
+
 st.markdown("</div>", unsafe_allow_html=True)
 
 st.caption("Nota: m² = |KM FINAL − KM INICIAL| × 1000 × LARGURA(m). Linhas incompletas tendem a gerar m²=0.")
