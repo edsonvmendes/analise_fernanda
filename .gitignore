@@ -1,0 +1,17 @@
+# Secrets do Streamlit
+.streamlit/secrets.toml
+
+# Dados locais
+data/
+*.xlsx
+*.xls
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Streamlit cache
+.streamlit/*.json
